@@ -1,0 +1,16 @@
+<h1>Websocket</h1>
+<script>
+	try {
+		const socket = new WebSocket("ws://localhost:8080")
+		socket.addEventListener("message", (event) => {
+			console.log("message from server", event.data)
+		})
+
+		socket.addEventListener("open", (event) => {
+			console.log("connected")
+			socket.send("hi from browser")
+		})
+	} catch (err) {
+		console.log(err)
+	}
+</script>

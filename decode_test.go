@@ -28,7 +28,7 @@ func TestDecodeWsSocket(t *testing.T) {
 	}
 
 	wantMsg := "hi from browser"
-	if msg != wantMsg {
-		t.Fatalf("did not get the right message, expected %s, got %s", wantMsg, msg)
+	if string(msg.payload) != wantMsg {
+		t.Fatalf("did not get the right message, expected %s, got %s", wantMsg, string(msg.payload))
 	}
 }

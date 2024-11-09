@@ -7,9 +7,26 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"strings"
 )
+
+type clientConnection struct {
+	netCon net.Conn
+	hashId string
+}
+
+type message struct {
+	isFragment bool
+	opcode     byte
+	reserverd  byte
+	isMasked   bool
+	length     uint64
+	payload    []byte
+}
+
+var connections = map[string]*clientConnection{}
 
 func main() {
 	server, err := net.Listen("tcp", "localhost:8080")
@@ -67,36 +84,49 @@ func main() {
 					if err != nil {
 						fmt.Printf("failed to send upgrade string: %+v\n", err)
 					}
+
+					connections[secretKey] = &clientConnection{
+						netCon: con,
+						hashId: serverSecret,
+					}
 				} else {
 					fmt.Println("msg")
-					fmt.Println(msg)
-					/*
-						parsedMsgSplitIdx := strings.Index(string(msg), "\r\n\r\n") + 4
-						msgContentStart := msg[parsedMsgSplitIdx:]
-						msgContentEnd := msg[:parsedMsgSplitIdx]
-						fmt.Println("msgConectStart", string(msgContentStart))
-						fmt.Println("msgContentEnd", string(msgContentEnd))
-					*/
+					decodedMsg, err := decodeWsMessage(msg)
+					if err != nil {
+						fmt.Printf("could not decode msg: %+v\n", err)
+					}
+
+					fmt.Println("decoded msg: ", string(decodedMsg.payload))
+					for _, sc := range connections {
+						encodedData, err := encodeWsMessage(decodedMsg)
+						if err != nil {
+							fmt.Println("could not encode msg data: ", err)
+						}
+						_, err = sc.netCon.Write(encodedData)
+						if err != nil {
+							fmt.Println("could not send message to client", err)
+						}
+					}
 				}
 			}
 		}()
 	}
 }
 
-func decodeWsMessage(msg []byte) (string, error) {
+func decodeWsMessage(msg []byte) (message, error) {
+	message := message{}
+
 	reader := bytes.NewReader(msg)
 	head := make([]byte, 2)
 	_, err := reader.ReadAt(head, 0)
 	if err != nil {
-		return "", err
+		return message, err
 	}
 
-	/*
-		isFragment := (head[0] & 0x80) == 0x00
-		isOpcode := head[0] & 0x0F
-		reserverd := (head[0] & 0x70)
-		isMasked := (head[1] & 0x80) == 0x80
-	*/
+	message.isFragment = (head[0] & 0x80) == 0x00
+	message.opcode = head[0] & 0x0F
+	message.reserverd = (head[0] & 0x70)
+	message.isMasked = (head[1] & 0x80) == 0x80
 	var length uint64
 	length = uint64(head[1] & 0x7F)
 	startFrom := 2
@@ -110,6 +140,8 @@ func decodeWsMessage(msg []byte) (string, error) {
 		startFrom = 8
 	}
 
+	message.length = length
+
 	mask := msg[startFrom : startFrom+4]
 	payload := make([]byte, length)
 	reader.ReadAt(payload, int64(startFrom)+4)
@@ -117,5 +149,35 @@ func decodeWsMessage(msg []byte) (string, error) {
 		payload[i] ^= mask[i%4]
 	}
 
-	return string(payload), nil
+	message.payload = payload
+
+	return message, nil
+}
+
+func encodeWsMessage(msg message) ([]byte, error) {
+	data := make([]byte, 2)
+	data[0] = 0x80 | msg.opcode
+
+	if msg.isFragment {
+		data[0] &= 0x7F
+	}
+
+	if msg.length <= 125 {
+		data[1] = byte(msg.length)
+		data = append(data, msg.payload...)
+	} else if msg.length > 125 && float64(msg.length) < math.Pow(2, 16) {
+		data[1] = byte(126)
+		size := make([]byte, 2)
+		binary.BigEndian.PutUint16(size, uint16(msg.length))
+		data = append(data, size...)
+		data = append(data, msg.payload...)
+	} else if float64(msg.length) >= math.Pow(2, 16) {
+		data[1] = byte(127)
+		size := make([]byte, 8)
+		binary.BigEndian.PutUint64(size, msg.length)
+		data = append(data, size...)
+		data = append(data, msg.payload...)
+	}
+
+	return data, nil
 }

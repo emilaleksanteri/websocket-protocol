@@ -5,17 +5,21 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"net"
 	"strings"
+	"sync"
+
+	"github.com/google/uuid"
 )
 
 type clientConnection struct {
-	netCon net.Conn
-	hashId string
+	netCon *net.TCPConn
 	closed bool
+	id     string
 }
 
 type message struct {
@@ -25,9 +29,76 @@ type message struct {
 	isMasked   bool
 	length     uint64
 	payload    []byte
+	clientId   string
 }
 
-var connections = map[string]*clientConnection{}
+type connections struct {
+	conns    []*clientConnection
+	mu       sync.Mutex
+	len      uint64
+	messages chan message
+}
+
+func (c *connections) addClient(con *net.TCPConn) *clientConnection {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	id := uuid.New().String()
+	newCon := &clientConnection{
+		netCon: con,
+		id:     id,
+	}
+
+	c.conns = append(c.conns, newCon)
+	c.len += 1
+
+	return newCon
+}
+
+func (c *connections) broadcast() {
+	for {
+		select {
+		case msg := <-c.messages:
+			fmt.Println("got msg: ", string(msg.payload))
+
+			encodedMsg, err := encodeWsMessage(msg)
+			if err != nil {
+				panic(fmt.Sprintf("could not encode ws message!! %+v\n", err))
+			}
+			for _, client := range c.conns {
+				if msg.clientId == client.id || client.closed {
+					continue
+				}
+
+				_, err := client.netCon.Write(encodedMsg)
+				if err != nil {
+					client.closed = true
+				}
+			}
+
+			if c.len == 0 {
+				continue
+			}
+
+			aliveCons := []*clientConnection{}
+			for _, client := range c.conns {
+				if !client.closed {
+					aliveCons = append(aliveCons, client)
+				} else {
+					client.netCon.Close()
+				}
+			}
+			c.len = uint64(len(aliveCons))
+			c.mu.Lock()
+			c.conns = aliveCons
+			c.mu.Unlock()
+		default:
+			continue
+		}
+	}
+}
+
+var serverConnections = connections{}
 
 func main() {
 	server, err := net.Listen("tcp", "localhost:8080")
@@ -37,7 +108,11 @@ func main() {
 	}
 	defer server.Close()
 
+	serverConnections.mu = sync.Mutex{}
+	serverConnections.messages = make(chan message)
+
 	fmt.Println("listening to connections at localhost:8080")
+	go serverConnections.broadcast()
 
 	for {
 		con, err := server.Accept()
@@ -45,92 +120,80 @@ func main() {
 			fmt.Printf("failed to accept connection: %+v\n", err)
 			return
 		}
+		tcpCon := con.(*net.TCPConn)
 
-		go handleConnection(con)
+		go handleConnection(tcpCon)
 	}
 }
 
-func handleConnection(con net.Conn) {
-	var myId string
+func handleConnection(con *net.TCPConn) {
+	myCon := serverConnections.addClient(con)
 	for {
 		msg := make([]byte, 1024)
-		if val, ok := connections[myId]; ok && val.closed {
-			return
-		}
-		_, err := con.Read(msg)
+		_, err := myCon.netCon.Read(msg)
 		if err != nil {
 			if err.Error() == "EOF" {
-				con.Close()
-				return
+				continue
 			}
 			fmt.Printf("could not read message from client: %+v\n", err)
-			continue
+			return
 		}
 
-		if strings.Contains(string(msg), "GET") {
-			fmt.Println("upgrade")
-			headers := strings.Split(string(msg), "\n")
-			secretKey := ""
-			for _, hdr := range headers {
-				if strings.Contains(hdr, "Sec-WebSocket-Key: ") {
-					secretKey = strings.TrimSpace(strings.Split(hdr, ":")[1])
-				}
-			}
-
-			if secretKey == "" {
-				fmt.Println("Sec-WebSocket-Key not found in headers")
-				con.Close()
-				return
-			}
-
-			concatWithWsKey := secretKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-			hasher := sha1.New()
-			hasher.Write([]byte(concatWithWsKey))
-			serverSecret := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
-			fmt.Println(serverSecret)
-
-			upgradeStr := "HTTP/1.1 101 Switching Protocols\r\n" +
-				"Connection: Upgrade\r\n" +
-				"Sec-WebSocket-Accept:" + serverSecret + "\r\n" +
-				"Upgrade: websocket\r\n" +
-				"\r\n"
-			_, err := con.Write([]byte(upgradeStr))
+		if strings.Contains(string(msg[:3]), "GET") {
+			err := myCon.handleUpgradeToWs(msg)
 			if err != nil {
-				fmt.Printf("failed to send upgrade string: %+v\n", err)
-				con.Close()
 				return
 			}
-
-			connections[secretKey] = &clientConnection{
-				netCon: con,
-				hashId: serverSecret,
-			}
-			myId = secretKey
 		} else {
+			fmt.Println("get msg")
 			decodedMsg, err := decodeWsMessage(msg)
 			if err != nil {
 				fmt.Printf("could not decode msg: %+v\n", err)
+				continue
 			}
+			decodedMsg.clientId = myCon.id
 
-			for key, sc := range connections {
-				if sc.closed || key == myId {
-					continue
-				}
+			fmt.Println("decded: ", string(decodedMsg.payload))
 
-				encodedData, err := encodeWsMessage(decodedMsg)
-				if err != nil {
-					fmt.Println("could not encode msg data: ", err)
-					continue
-				}
-				_, err = sc.netCon.Write(encodedData)
-				if err != nil {
-					fmt.Println("could not send message to client", err)
-					sc.closeWsConnMsg()
-					continue
-				}
-			}
+			serverConnections.messages <- decodedMsg
+			fmt.Println("added to chan")
 		}
 	}
+
+}
+
+func (client *clientConnection) handleUpgradeToWs(handshake []byte) error {
+	headers := strings.Split(string(handshake), "\n")
+	secretKey := ""
+	for _, hdr := range headers {
+		if strings.Contains(hdr, "Sec-WebSocket-Key: ") {
+			secretKey = strings.TrimSpace(strings.Split(hdr, ":")[1])
+		}
+	}
+
+	if secretKey == "" {
+		fmt.Println("Sec-WebSocket-Key not found in headers")
+		return errors.New("No secret provided")
+	}
+
+	concatWithWsKey := secretKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	hasher := sha1.New()
+	hasher.Write([]byte(concatWithWsKey))
+	serverSecret := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	fmt.Println(serverSecret)
+
+	upgradeStr := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept:" + serverSecret + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"\r\n"
+	_, err := client.netCon.Write([]byte(upgradeStr))
+	if err != nil {
+		fmt.Printf("failed to send upgrade string: %+v\n", err)
+		return fmt.Errorf("failed to send upgrade response to client: %+v", err)
+	}
+
+	return nil
 
 }
 

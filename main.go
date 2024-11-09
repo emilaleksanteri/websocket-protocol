@@ -145,18 +145,13 @@ func handleConnection(con *net.TCPConn) {
 				return
 			}
 		} else {
-			fmt.Println("get msg")
-			decodedMsg, err := decodeWsMessage(msg)
+			decodedMsg, err := decodeWsMessage(msg, myCon.id)
 			if err != nil {
 				fmt.Printf("could not decode msg: %+v\n", err)
 				continue
 			}
-			decodedMsg.clientId = myCon.id
-
-			fmt.Println("decded: ", string(decodedMsg.payload))
 
 			serverConnections.messages <- decodedMsg
-			fmt.Println("added to chan")
 		}
 	}
 
@@ -197,8 +192,8 @@ func (client *clientConnection) handleUpgradeToWs(handshake []byte) error {
 
 }
 
-func decodeWsMessage(msg []byte) (message, error) {
-	message := message{}
+func decodeWsMessage(msg []byte, clientId string) (message, error) {
+	message := message{clientId: clientId}
 
 	reader := bytes.NewReader(msg)
 	head := make([]byte, 2)
